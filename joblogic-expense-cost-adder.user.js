@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Add expense costs to jobs (check + add, Excel upload)
 // @namespace    http://tampermonkey.net/
-// @version      1.2
+// @version      1.3
 // @description  Upload (or paste) an expense export (Payhawk .xlsx/.csv, Pleo also works). For each row it finds the job (Job ref / Salesforce ref / Quote UP-number from Job Ref/Details + notes), reads the job's Costs page and checks whether the receipt NET is already on it (same matching as the Cost Reconciler). Rows NOT in the job are ticked to ADD as a Material line (cost = Net, qty 1, 20% VAT, job uplift; project/quoted jobs added NON-chargeable). Rows already in the job (or entered incorrectly, or on an undelivered PO) are left alone. Check first, untick anything you don't want, then Add ticked to jobs.
 // @match        https://go.joblogic.com/*
 // @require      https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js
@@ -42,7 +42,7 @@
 
     const SCRIPT_ID = 'expense-cost-adder';
     const SCRIPT_LABEL = '➕ Add expense costs to jobs';
-    const SCRIPT_VERSION = ((typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.2');
+    const SCRIPT_VERSION = ((typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.3');
     const SCRIPT_COLOR = '#4c9f01';
     const SCRIPT_DESC = 'Upload the Payhawk expense export (.xlsx) or paste it with the header row, then click Check. Each row is checked against its job\'s costs: already in job → left alone; not in job → ticked to add. Untick anything you don\'t want, then Add ticked to jobs.';
 
@@ -97,6 +97,7 @@
     // month > 12 (that silently breaks AddMaterialCosts).
     // ===================================================================
     let inputDateMDY = false;
+    let sourceLabel = 'Payhawk';   // 'Pleo' when the sheet is a Pleo export (set per run)
     function normalizeDate(v) {
         if (typeof v === 'number' || /^\d{5}(\.\d+)?$/.test(String(v || '').trim())) {
             const n = Number(v);
@@ -484,6 +485,7 @@
         if (net == null && gross != null) net = gross / (1 + r);
         if (gross == null && net != null) gross = net * (1 + r);
         const expenseId = str(col(row, ['Expense ID']));
+        const date = normalizeDate(dateCell(row));
         const receipt = expenseId || str(col(row, ['Receipt', 'Document Number']));
         const docNo = str(col(row, ['Document Number']));
         return {
@@ -491,16 +493,25 @@
             refund: isNegative(netRaw) || isNegative(grossRaw),
             refs: extractRefs([jobRef, note, supplier].join('  ||  ')),
             owner: str(col(row, ['Expense Owner', 'Owner'])),
-            date: normalizeDate(dateCell(row)),
+            date,
             // Cost line description: supplier + note, tagged with the Payhawk expense id
             // so it can be traced (and recognised on a re-run).
-            costDesc: buildDescription(supplier, note, expenseId, str(col(row, ['Xero description', 'Cost description'])))
+            costDesc: buildDescription(supplier, note, expenseId, str(col(row, ['Xero description', 'Cost description'])), date)
         };
     }
-    function buildDescription(supplier, note, expenseId, explicit) {
+    // "Payhawk Oct 26" from the expense's own date (DD/MM/YYYY), so a September
+    // receipt reads "Sep 26" whenever it is uploaded. Falls back to today.
+    const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    function sourceSuffix(dateDMY) {
+        const m = String(dateDMY || '').match(/^\d{2}\/(\d{2})\/(\d{4})$/);
+        const mo = m ? parseInt(m[1], 10) - 1 : new Date().getMonth();
+        const yr = m ? m[2] : String(new Date().getFullYear());
+        return ` - ${sourceLabel} ${MONTHS[mo]} ${yr.slice(-2)}`;
+    }
+    function buildDescription(supplier, note, expenseId, explicit, dateDMY) {
         let d = explicit || [supplier, note.replace(/^job ref\/details:\s*/i, '')].filter(Boolean).join(' - ') || 'Materials';
-        const tag = expenseId ? ` [PH#${expenseId}]` : '';
-        return (d.slice(0, 250 - tag.length) + tag).trim();
+        const tail = sourceSuffix(dateDMY) + (expenseId ? ` [PH#${expenseId}]` : '');
+        return (d.slice(0, 250 - tail.length) + tail).trim();
     }
 
     // ===================================================================
@@ -645,6 +656,7 @@
         if (!parsed.rows.length) { alert('Upload the Excel export, or paste the rows including the header row.'); return; }
         running = true; results = []; jobCache.clear();
         inputDateMDY = detectDateOrder(parsed.rows, parsed.headers);
+        sourceLabel = (parsed.headers.some(h => /orig\.? amount/i.test(h)) && !parsed.headers.some(h => /expense id|payment id/i.test(h))) ? 'Pleo' : 'Payhawk';
         checkBtn.style.display = 'none'; addBtn.style.display = 'none'; copyBtn.style.display = 'none'; stopBtn.style.display = 'inline-block';
         logArea.innerHTML = ''; resultsBox.innerHTML = '';
         log(`Read ${parsed.rows.length} rows, ${parsed.headers.length} columns. Typed dates read as ${inputDateMDY ? 'M/D/Y' : 'D/M/Y'}.`, '#0af');
